@@ -1,20 +1,22 @@
 blueprint:
-  name: Bambu Lab - 炒面检测
-  description: "基于 Obico ML 的打印失败检测。检测到失败时通过 Telegram 发送带图警报，并支持远程暂停/停止打印。"
+  name: Bambu Lab - 炒面检测 (Gotify)
+  description: "基于 Obico ML 的打印失败检测。检测到失败时通过 Gotify 发送带图警报。"
   domain: automation
   input:
-    # --- 核心配置 ---
-    telegram_bot_entry:
-      name: Telegram 机器人
-      description: "请指定用于发送通知和接收控制指令的机器人（必须配置为 Polling 模式）。"
-      selector:
-        config_entry:
-          integration: telegram_bot
+    # --- Gotify 配置 ---
+    gotify_server_url:
+      name: Gotify 服务器地址
+      description: "Gotify 服务器的完整 URL（如 http://192.168.1.100:8080）"
+      default: http://192.168.1.100:8080
+    gotify_app_token:
+      name: Gotify 应用 Token
+      description: "在 Gotify 中创建应用后获取的 Token"
+      default: your_gotify_app_token
 
     # --- 服务地址 ---
     public_home_assistant_host:
       name: Home Assistant 公网地址
-      description: Telegram 服务器通过此地址获取图片 (必须 HTTPS)。
+      description: Gotify 消息中图片的访问地址 (必须 HTTPS 或可达地址)。
       default: https://ha.example.com
     internal_home_assistant_host:
       name: Home Assistant 内网地址
@@ -115,7 +117,8 @@ blueprint:
             domain: light
 
 variables:
-  TG_BOT_ID: !input telegram_bot_entry
+  GOTIFY_URL: !input gotify_server_url
+  GOTIFY_TOKEN: !input gotify_app_token
   PUBLIC_HA_HOST_VAR: !input public_home_assistant_host
   INTERNAL_HA_HOST_VAR: !input internal_home_assistant_host
   PRINTER_CAMERA_VAR: !input printer_camera
@@ -138,11 +141,6 @@ trigger:
   - platform: time_pattern
     id: BAMBU_LAB_DETECTION_TRIGGER
     seconds: !input detection_frequency
-
-  # 3. Telegram 按钮交互
-  - platform: event
-    event_type: telegram_callback
-    id: TG_CALLBACK_EVENT
 
 action:
   - choose:
@@ -174,73 +172,20 @@ action:
                   entity_id: !input printer_chamber_light
 
       # =======================================================
-      # 场景 2: 处理 Telegram 按钮点击
-      # =======================================================
-      - conditions:
-          - condition: trigger
-            id: TG_CALLBACK_EVENT
-        sequence:
-          - service: telegram_bot.answer_callback_query
-            data:
-              config_entry_id: "{{ TG_BOT_ID }}"
-              callback_query_id: "{{ trigger.event.data.id }}"
-              message: "指令处理中..."
-
-          - choose:
-              - conditions:
-                  - condition: template
-                    value_template: "{{ 'bambu_pause' in trigger.event.data.data }}"
-                sequence:
-                  - service: button.press
-                    target:
-                      entity_id: !input printer_pause_button
-                  - service: telegram_bot.send_message
-                    data:
-                      config_entry_id: "{{ TG_BOT_ID }}"
-                      target: "{{ trigger.event.data.user_id }}"
-                      message: "⏸️ 已执行暂停"
-
-              - conditions:
-                  - condition: template
-                    value_template: "{{ 'bambu_resume' in trigger.event.data.data }}"
-                sequence:
-                  - service: button.press
-                    target:
-                      entity_id: !input printer_resume_button
-                  - service: telegram_bot.send_message
-                    data:
-                      config_entry_id: "{{ TG_BOT_ID }}"
-                      target: "{{ trigger.event.data.user_id }}"
-                      message: "▶️ 已执行恢复"
-
-              - conditions:
-                  - condition: template
-                    value_template: "{{ 'bambu_stop' in trigger.event.data.data }}"
-                sequence:
-                  - service: button.press
-                    target:
-                      entity_id: !input printer_stop_button
-                  - service: telegram_bot.send_message
-                    data:
-                      config_entry_id: "{{ TG_BOT_ID }}"
-                      target: "{{ trigger.event.data.user_id }}"
-                      message: "⏹️ 已执行停止"
-
-      # =======================================================
-      # 场景 3: 执行检测与 ML 计算
+      # 场景 2: 执行检测与 ML 计算
       # =======================================================
       - conditions:
           - condition: trigger
             id: BAMBU_LAB_DETECTION_TRIGGER
         sequence:
-          # 3.1 状态检查
+          # 2.1 状态检查
           - if:
               - condition: template
                 value_template: "{{ not is_state(printer_print_status_sensor, 'running') }}"
             then:
               - stop: "Printer is not running."
 
-          # 3.2 自动补光
+          # 2.2 自动补光
           - if:
               - condition: template
                 value_template: "{{ is_state(printer_chamber_light, 'off') and AUTO_LIGHT_VAR }}"
@@ -249,7 +194,7 @@ action:
                 target:
                   entity_id: !input printer_chamber_light
 
-          # 3.3 调用 ML 预测 (内网加速)
+          # 2.3 调用 ML 预测 (内网加速)
           - service: bambu_lab_p1_spaghetti_detection.predict
             data:
               obico_host: !input obico_host
@@ -257,7 +202,7 @@ action:
               image_url: "{{ INTERNAL_HA_HOST_VAR }}{{ state_attr(PRINTER_CAMERA_VAR, 'entity_picture') }}"
             response_variable: result
 
-          # 3.4 核心数学模型计算 (EWMA 平滑算法)
+          # 2.4 核心数学模型计算 (EWMA 平滑算法)
           - service: number.set_value
             data:
               value: "{{ result.result.detections | map(attribute=1) | sum | float }}"
@@ -379,21 +324,17 @@ action:
             then:
               - stop: "Notification cooldown"
 
-          # 3.5 触发报警逻辑 (归一化概率 > 0.7)
+          # 2.5 触发报警逻辑 (归一化概率 > 0.7)
           - if:
               - condition: template
                 value_template: "{{ states('number.bambu_lab_p1_spaghetti_detection_normalized_p') | float > 0.7 }}"
             then:
-              # 发送图片到 Telegram
-              - action: telegram_bot.send_photo
+              # 发送通知到 Gotify
+              - service: rest_command.gotify_notification
                 data:
-                  config_entry_id: "{{ TG_BOT_ID }}"
-                  target: 1916644904
-                  caption: "⚠️ 警告！检测到炒面风险：{{ (states('number.bambu_lab_p1_spaghetti_detection_normalized_p') | float * 100) | int }}%"
-                  url: "{{ PUBLIC_HA_HOST_VAR }}{{ state_attr(PRINTER_CAMERA_VAR, 'entity_picture') }}"
-                  inline_keyboard:
-                    - "▶️ 恢复:/bambu_resume, ⏸️ 暂停:/bambu_pause"
-                    - "⏹️ 停止:/bambu_stop"
+                  title: "⚠️ 炒面检测警告"
+                  message: "检测到炒面风险：{{ (states('number.bambu_lab_p1_spaghetti_detection_normalized_p') | float * 100) | int }}%\n\n📷 摄像头快照：\n{{ PUBLIC_HA_HOST_VAR }}{{ state_attr(PRINTER_CAMERA_VAR, 'entity_picture') }}"
+                  priority: 8
 
               # 更新最后通知时间
               - service: datetime.set_value
